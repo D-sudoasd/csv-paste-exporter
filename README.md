@@ -55,6 +55,7 @@ Copy columns -> Paste -> Preview -> Export
 - Pad uneven rows with empty cells so the exported table is rectangular.
 - Preview data before export.
 - Treat the first row as a header for easier preview.
+- Quickly preview a point-line chart from selected X/Y columns.
 - Delete selected columns.
 - Move columns left or right.
 - Restore the original parsed table after column edits.
@@ -129,6 +130,7 @@ The test suite covers:
 - UTF-8 BOM, UTF-8, and GBK encoding behavior
 - column delete and move operations
 - first-row-as-header preview logic
+- quick chart numeric extraction and axis-range behavior
 - settings file round trip
 
 Run:

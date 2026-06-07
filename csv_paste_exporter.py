@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import os
 import re
 from collections import Counter
@@ -58,6 +59,14 @@ class TableAnalysis:
     delimiter_name: str
     had_ragged_rows: bool
     empty_cell_count: int
+
+
+@dataclass(frozen=True)
+class ChartData:
+    points: list[tuple[float, float]]
+    x_range: tuple[float, float] | None
+    y_range: tuple[float, float] | None
+    skipped_rows: int
 
 
 def parse_table_text(text: str) -> list[list[str]]:
@@ -149,6 +158,113 @@ def get_preview_headings(rows: list[list[str]], first_row_is_header: bool) -> li
         heading.strip() if heading.strip() else f"列 {index + 1}"
         for index, heading in enumerate(first_row)
     ]
+
+
+def get_default_chart_column_indices(
+    rows: list[list[str]],
+) -> tuple[int | None, int | None]:
+    column_count = max((len(row) for row in rows), default=0)
+    if column_count < 2:
+        return None, None
+    return 0, 1
+
+
+def get_chart_column_labels(
+    rows: list[list[str]],
+    first_row_is_header: bool,
+) -> list[str]:
+    return get_preview_headings(rows, first_row_is_header)
+
+
+def calculate_axis_range(values: Iterable[float]) -> tuple[float, float] | None:
+    numeric_values = list(values)
+    if not numeric_values:
+        return None
+
+    minimum = min(numeric_values)
+    maximum = max(numeric_values)
+    if minimum != maximum:
+        return minimum, maximum
+
+    padding = abs(minimum) * 0.05
+    if padding == 0:
+        padding = 1.0
+    return minimum - padding, maximum + padding
+
+
+def zoom_axis_range(
+    axis_range: tuple[float, float],
+    anchor: float,
+    scale: float,
+    full_range: tuple[float, float] | None = None,
+) -> tuple[float, float]:
+    minimum, maximum = axis_range
+    if scale <= 0 or minimum >= maximum:
+        return axis_range
+
+    new_minimum = anchor - (anchor - minimum) * scale
+    new_maximum = anchor + (maximum - anchor) * scale
+    if full_range is None:
+        return new_minimum, new_maximum
+
+    full_minimum, full_maximum = full_range
+    full_width = full_maximum - full_minimum
+    new_width = new_maximum - new_minimum
+    if full_width <= 0 or new_width >= full_width:
+        return full_range
+
+    if new_minimum < full_minimum:
+        shift = full_minimum - new_minimum
+        new_minimum += shift
+        new_maximum += shift
+    if new_maximum > full_maximum:
+        shift = new_maximum - full_maximum
+        new_minimum -= shift
+        new_maximum -= shift
+
+    return max(new_minimum, full_minimum), min(new_maximum, full_maximum)
+
+
+def build_chart_data(
+    rows: list[list[str]],
+    x_column: int,
+    y_column: int,
+    first_row_is_header: bool,
+) -> ChartData:
+    column_count = max((len(row) for row in rows), default=0)
+    if (
+        not rows
+        or x_column < 0
+        or y_column < 0
+        or x_column >= column_count
+        or y_column >= column_count
+    ):
+        return ChartData([], None, None, 0)
+
+    data_rows = rows[1:] if first_row_is_header else rows
+    points: list[tuple[float, float]] = []
+    skipped_rows = 0
+    for row in data_rows:
+        try:
+            x_text = row[x_column].strip()
+            y_text = row[y_column].strip()
+            x_value = float(x_text)
+            y_value = float(y_text)
+        except (IndexError, ValueError):
+            skipped_rows += 1
+            continue
+
+        if not math.isfinite(x_value) or not math.isfinite(y_value):
+            skipped_rows += 1
+            continue
+        points.append((x_value, y_value))
+
+    return ChartData(
+        points,
+        calculate_axis_range(point[0] for point in points),
+        calculate_axis_range(point[1] for point in points),
+        skipped_rows,
+    )
 
 
 def build_default_filename(format_key: str, now: datetime | None = None) -> str:
@@ -285,8 +401,8 @@ class CsvPasteExporterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("CSV 列数据整理导出")
-        self.root.geometry("980x700")
-        self.root.minsize(760, 520)
+        self.root.geometry("1180x720")
+        self.root.minsize(920, 560)
 
         self.settings_path = get_settings_path()
         self.settings = load_settings(self.settings_path)
@@ -307,6 +423,17 @@ class CsvPasteExporterApp:
         self.first_row_is_header_var = tk.BooleanVar(
             value=bool(self.settings["first_row_is_header"])
         )
+        self.chart_x_var = tk.StringVar(value="")
+        self.chart_y_var = tk.StringVar(value="")
+        self.chart_info_var = tk.StringVar(value="")
+        self.chart_x_index: int | None = None
+        self.chart_y_index: int | None = None
+        self.chart_points: list[tuple[float, float]] = []
+        self.chart_full_range: tuple[float, float, float, float] | None = None
+        self.chart_view_range: tuple[float, float, float, float] | None = None
+        self.chart_empty_message = "粘贴至少两列数值数据后显示图表"
+        self.chart_drag_start: tuple[int, int] | None = None
+        self.chart_drag_rect_id: int | None = None
 
         self._build_widgets()
         self._bind_events()
@@ -398,7 +525,8 @@ class CsvPasteExporterApp:
         text_x.grid(row=1, column=0, sticky="ew")
 
         preview_frame = ttk.Labelframe(paned, text="预览", padding=8)
-        preview_frame.columnconfigure(1, weight=1)
+        preview_frame.columnconfigure(1, weight=3)
+        preview_frame.columnconfigure(3, weight=2)
         preview_frame.rowconfigure(0, weight=1)
 
         column_frame = ttk.Frame(preview_frame)
@@ -425,6 +553,52 @@ class CsvPasteExporterApp:
         tree_y.grid(row=0, column=2, sticky="ns")
         tree_x.grid(row=1, column=1, sticky="ew")
 
+        chart_frame = ttk.Labelframe(preview_frame, text="快速图", padding=8)
+        chart_frame.grid(row=0, column=3, rowspan=2, sticky="nsew", padx=(8, 0))
+        chart_frame.columnconfigure(0, weight=1)
+        chart_frame.rowconfigure(1, weight=1)
+
+        chart_controls = ttk.Frame(chart_frame)
+        chart_controls.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        chart_controls.columnconfigure(1, weight=1)
+        chart_controls.columnconfigure(3, weight=1)
+        ttk.Label(chart_controls, text="X").grid(row=0, column=0, padx=(0, 4))
+        self.chart_x_box = ttk.Combobox(
+            chart_controls,
+            textvariable=self.chart_x_var,
+            state="disabled",
+            width=12,
+        )
+        self.chart_x_box.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(chart_controls, text="Y").grid(row=0, column=2, padx=(0, 4))
+        self.chart_y_box = ttk.Combobox(
+            chart_controls,
+            textvariable=self.chart_y_var,
+            state="disabled",
+            width=12,
+        )
+        self.chart_y_box.grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            chart_controls,
+            text="自适应",
+            command=self.reset_chart_view,
+        ).grid(row=0, column=4)
+
+        self.chart_canvas = tk.Canvas(
+            chart_frame,
+            background="white",
+            highlightthickness=1,
+            highlightbackground="#d0d0d0",
+            width=320,
+            height=240,
+        )
+        self.chart_canvas.grid(row=1, column=0, sticky="nsew")
+        ttk.Label(
+            chart_frame,
+            textvariable=self.chart_info_var,
+            anchor="w",
+        ).grid(row=2, column=0, sticky="ew", pady=(6, 0))
+
         paned.add(paste_frame, weight=1)
         paned.add(preview_frame, weight=2)
 
@@ -439,6 +613,14 @@ class CsvPasteExporterApp:
     def _bind_events(self) -> None:
         self.text.bind("<KeyRelease>", self._schedule_preview)
         self.text.bind("<<Paste>>", self._schedule_preview)
+        self.chart_x_box.bind("<<ComboboxSelected>>", self._on_chart_axis_changed)
+        self.chart_y_box.bind("<<ComboboxSelected>>", self._on_chart_axis_changed)
+        self.chart_canvas.bind("<Configure>", self._on_chart_canvas_configure)
+        self.chart_canvas.bind("<MouseWheel>", self._on_chart_mousewheel)
+        self.chart_canvas.bind("<ButtonPress-1>", self._on_chart_drag_start)
+        self.chart_canvas.bind("<B1-Motion>", self._on_chart_drag_move)
+        self.chart_canvas.bind("<ButtonRelease-1>", self._on_chart_drag_end)
+        self.chart_canvas.bind("<Double-Button-1>", self.reset_chart_view)
 
     def _schedule_preview(self, _event: tk.Event | None = None) -> None:
         self.text_dirty = True
@@ -472,7 +654,7 @@ class CsvPasteExporterApp:
         self.original_rows = []
         self.current_analysis = TableAnalysis([], None, "无", False, 0)
         self.text_dirty = False
-        self._render_table([])
+        self._render_table([], reset_chart_selection=True)
         self.status_var.set("已清空")
 
     def refresh_preview(self) -> None:
@@ -489,14 +671,14 @@ class CsvPasteExporterApp:
             self.rows = []
             self.original_rows = []
             self.current_analysis = TableAnalysis([], None, "无", False, 0)
-            self._render_table([])
+            self._render_table([], reset_chart_selection=True)
             self.status_var.set(f"解析失败：{exc}")
             return
 
         self.original_rows = _copy_rows(self.current_analysis.rows)
         self.rows = _copy_rows(self.current_analysis.rows)
         self.text_dirty = False
-        self._render_table(self.rows)
+        self._render_table(self.rows, reset_chart_selection=True)
         self._update_status()
 
     def export_csv(self) -> None:
@@ -585,12 +767,14 @@ class CsvPasteExporterApp:
         self,
         rows: list[list[str]],
         selected_indices: set[int] | None = None,
+        reset_chart_selection: bool = False,
     ) -> None:
         self.tree.delete(*self.tree.get_children())
         self.tree["columns"] = ()
         self.column_list.delete(0, tk.END)
 
         if not rows:
+            self._update_chart_controls(reset_selection=True)
             return
 
         column_count = max(len(row) for row in rows)
@@ -612,6 +796,322 @@ class CsvPasteExporterApp:
         for row in display_rows[:PREVIEW_ROW_LIMIT]:
             values = row + [""] * (column_count - len(row))
             self.tree.insert("", tk.END, values=values)
+
+        self._update_chart_controls(reset_selection=reset_chart_selection)
+
+    def _update_chart_controls(self, reset_selection: bool = False) -> None:
+        labels = get_chart_column_labels(self.rows, self.first_row_is_header_var.get())
+        values = [f"{index + 1}. {label}" for index, label in enumerate(labels)]
+        column_count = len(values)
+        self.chart_x_box.configure(values=values)
+        self.chart_y_box.configure(values=values)
+
+        if column_count < 2:
+            self.chart_x_index = None
+            self.chart_y_index = None
+            self.chart_x_var.set("")
+            self.chart_y_var.set("")
+            self.chart_x_box.configure(state="disabled")
+            self.chart_y_box.configure(state="disabled")
+            self.chart_info_var.set("")
+            self._set_chart_empty("至少需要两列数据才能画图")
+            return
+
+        if reset_selection:
+            self.chart_x_index, self.chart_y_index = get_default_chart_column_indices(
+                self.rows
+            )
+        else:
+            if self.chart_x_index is None or self.chart_x_index >= column_count:
+                self.chart_x_index = 0
+            if self.chart_y_index is None or self.chart_y_index >= column_count:
+                self.chart_y_index = 1
+
+        if self.chart_x_index is None or self.chart_y_index is None:
+            self._set_chart_empty("至少需要两列数据才能画图")
+            return
+
+        self.chart_x_box.configure(state="readonly")
+        self.chart_y_box.configure(state="readonly")
+        self.chart_x_var.set(values[self.chart_x_index])
+        self.chart_y_var.set(values[self.chart_y_index])
+        self._refresh_chart(reset_view=True)
+
+    def _on_chart_axis_changed(self, _event: tk.Event | None = None) -> None:
+        x_index = self.chart_x_box.current()
+        y_index = self.chart_y_box.current()
+        if x_index >= 0:
+            self.chart_x_index = x_index
+        if y_index >= 0:
+            self.chart_y_index = y_index
+        self._refresh_chart(reset_view=True)
+
+    def reset_chart_view(self, _event: tk.Event | None = None) -> str | None:
+        if self.chart_full_range is None:
+            return None
+
+        self.chart_view_range = self.chart_full_range
+        self._draw_chart()
+        return "break"
+
+    def _refresh_chart(self, reset_view: bool = False) -> None:
+        if self.chart_x_index is None or self.chart_y_index is None:
+            self.chart_points = []
+            self.chart_full_range = None
+            self.chart_view_range = None
+            self._set_chart_empty("至少需要两列数据才能画图")
+            return
+
+        chart_data = build_chart_data(
+            self.rows,
+            self.chart_x_index,
+            self.chart_y_index,
+            self.first_row_is_header_var.get(),
+        )
+        self.chart_points = chart_data.points
+        if (
+            len(chart_data.points) < 2
+            or chart_data.x_range is None
+            or chart_data.y_range is None
+        ):
+            self.chart_full_range = None
+            self.chart_view_range = None
+            suffix = ""
+            if chart_data.skipped_rows:
+                suffix = f"，已跳过 {chart_data.skipped_rows} 行"
+            self.chart_info_var.set("")
+            self._set_chart_empty(f"有效数值点不足 2 个{suffix}")
+            return
+
+        self.chart_full_range = (
+            chart_data.x_range[0],
+            chart_data.x_range[1],
+            chart_data.y_range[0],
+            chart_data.y_range[1],
+        )
+        if reset_view or self.chart_view_range is None:
+            self.chart_view_range = self.chart_full_range
+
+        skipped = f"，跳过 {chart_data.skipped_rows} 行" if chart_data.skipped_rows else ""
+        self.chart_info_var.set(f"{len(chart_data.points)} 个有效点{skipped}")
+        self._draw_chart()
+
+    def _set_chart_empty(self, message: str) -> None:
+        self.chart_empty_message = message
+        self.chart_points = []
+        self.chart_full_range = None
+        self.chart_view_range = None
+        self._draw_chart_empty(message)
+
+    def _chart_canvas_size(self) -> tuple[int, int]:
+        width = self.chart_canvas.winfo_width()
+        height = self.chart_canvas.winfo_height()
+        if width <= 1:
+            width = int(float(self.chart_canvas.cget("width")))
+        if height <= 1:
+            height = int(float(self.chart_canvas.cget("height")))
+        return width, height
+
+    def _chart_plot_bounds(self) -> tuple[int, int, int, int]:
+        width, height = self._chart_canvas_size()
+        left = 52
+        top = 16
+        right = max(left + 40, width - 16)
+        bottom = max(top + 40, height - 38)
+        return left, top, right, bottom
+
+    def _draw_chart_empty(self, message: str) -> None:
+        self.chart_canvas.delete("all")
+        width, height = self._chart_canvas_size()
+        self.chart_canvas.create_text(
+            width / 2,
+            height / 2,
+            text=message,
+            fill="#666666",
+            width=max(120, width - 30),
+            justify=tk.CENTER,
+        )
+
+    def _draw_chart(self) -> None:
+        if self.chart_view_range is None or not self.chart_points:
+            self._draw_chart_empty(self.chart_empty_message)
+            return
+
+        self.chart_canvas.delete("all")
+        left, top, right, bottom = self._chart_plot_bounds()
+        x_min, x_max, y_min, y_max = self.chart_view_range
+        width = right - left
+        height = bottom - top
+
+        for index in range(6):
+            t = index / 5
+            x = left + width * t
+            y = top + height * t
+            self.chart_canvas.create_line(x, top, x, bottom, fill="#eeeeee")
+            self.chart_canvas.create_line(left, y, right, y, fill="#eeeeee")
+            x_value = x_min + (x_max - x_min) * t
+            y_value = y_max - (y_max - y_min) * t
+            self.chart_canvas.create_text(
+                x,
+                bottom + 7,
+                text=self._format_axis_label(x_value),
+                anchor="n",
+                fill="#555555",
+            )
+            self.chart_canvas.create_text(
+                left - 6,
+                y,
+                text=self._format_axis_label(y_value),
+                anchor="e",
+                fill="#555555",
+            )
+
+        visible_points = [
+            self._chart_data_to_canvas(x_value, y_value)
+            for x_value, y_value in self.chart_points
+            if x_min <= x_value <= x_max and y_min <= y_value <= y_max
+        ]
+        if len(visible_points) > 2500:
+            step = math.ceil(len(visible_points) / 2500)
+            visible_points = visible_points[::step]
+
+        if len(visible_points) >= 2:
+            flattened = [coord for point in visible_points for coord in point]
+            self.chart_canvas.create_line(
+                *flattened,
+                fill="#2563eb",
+                width=2,
+            )
+        if len(visible_points) <= 800:
+            for x, y in visible_points:
+                self.chart_canvas.create_oval(
+                    x - 2,
+                    y - 2,
+                    x + 2,
+                    y + 2,
+                    fill="#2563eb",
+                    outline="",
+                )
+
+        self.chart_canvas.create_rectangle(left, top, right, bottom, outline="#777777")
+
+    def _format_axis_label(self, value: float) -> str:
+        return f"{value:.4g}"
+
+    def _chart_data_to_canvas(self, x_value: float, y_value: float) -> tuple[float, float]:
+        if self.chart_view_range is None:
+            return 0.0, 0.0
+
+        left, top, right, bottom = self._chart_plot_bounds()
+        x_min, x_max, y_min, y_max = self.chart_view_range
+        x = left + (x_value - x_min) / (x_max - x_min) * (right - left)
+        y = top + (y_max - y_value) / (y_max - y_min) * (bottom - top)
+        return x, y
+
+    def _chart_canvas_to_data(self, x: int, y: int) -> tuple[float, float]:
+        if self.chart_view_range is None:
+            return 0.0, 0.0
+
+        left, top, right, bottom = self._chart_plot_bounds()
+        x_min, x_max, y_min, y_max = self.chart_view_range
+        x_value = x_min + (x - left) / (right - left) * (x_max - x_min)
+        y_value = y_max - (y - top) / (bottom - top) * (y_max - y_min)
+        return x_value, y_value
+
+    def _is_in_chart_plot(self, x: int, y: int) -> bool:
+        left, top, right, bottom = self._chart_plot_bounds()
+        return left <= x <= right and top <= y <= bottom
+
+    def _clamp_chart_canvas_point(self, x: int, y: int) -> tuple[int, int]:
+        left, top, right, bottom = self._chart_plot_bounds()
+        return min(max(x, left), right), min(max(y, top), bottom)
+
+    def _on_chart_canvas_configure(self, _event: tk.Event | None = None) -> None:
+        if self.chart_view_range is None:
+            self._draw_chart_empty(self.chart_empty_message)
+            return
+        self._draw_chart()
+
+    def _on_chart_mousewheel(self, event: tk.Event) -> str | None:
+        if (
+            self.chart_view_range is None
+            or self.chart_full_range is None
+            or not self._is_in_chart_plot(event.x, event.y)
+        ):
+            return None
+
+        x_anchor, y_anchor = self._chart_canvas_to_data(event.x, event.y)
+        scale = 0.8 if event.delta > 0 else 1.25
+        x_min, x_max, y_min, y_max = self.chart_view_range
+        full_x_min, full_x_max, full_y_min, full_y_max = self.chart_full_range
+        new_x_min, new_x_max = zoom_axis_range(
+            (x_min, x_max),
+            x_anchor,
+            scale,
+            (full_x_min, full_x_max),
+        )
+        new_y_min, new_y_max = zoom_axis_range(
+            (y_min, y_max),
+            y_anchor,
+            scale,
+            (full_y_min, full_y_max),
+        )
+        self.chart_view_range = new_x_min, new_x_max, new_y_min, new_y_max
+        self._draw_chart()
+        return "break"
+
+    def _on_chart_drag_start(self, event: tk.Event) -> str | None:
+        if self.chart_view_range is None or not self._is_in_chart_plot(event.x, event.y):
+            return None
+
+        self.chart_drag_start = self._clamp_chart_canvas_point(event.x, event.y)
+        if self.chart_drag_rect_id is not None:
+            self.chart_canvas.delete(self.chart_drag_rect_id)
+        x, y = self.chart_drag_start
+        self.chart_drag_rect_id = self.chart_canvas.create_rectangle(
+            x,
+            y,
+            x,
+            y,
+            outline="#2563eb",
+            dash=(3, 2),
+        )
+        return "break"
+
+    def _on_chart_drag_move(self, event: tk.Event) -> str | None:
+        if self.chart_drag_start is None or self.chart_drag_rect_id is None:
+            return None
+
+        x, y = self._clamp_chart_canvas_point(event.x, event.y)
+        start_x, start_y = self.chart_drag_start
+        self.chart_canvas.coords(self.chart_drag_rect_id, start_x, start_y, x, y)
+        return "break"
+
+    def _on_chart_drag_end(self, event: tk.Event) -> str | None:
+        if self.chart_drag_start is None:
+            return None
+
+        start_x, start_y = self.chart_drag_start
+        end_x, end_y = self._clamp_chart_canvas_point(event.x, event.y)
+        if self.chart_drag_rect_id is not None:
+            self.chart_canvas.delete(self.chart_drag_rect_id)
+        self.chart_drag_start = None
+        self.chart_drag_rect_id = None
+
+        if abs(end_x - start_x) < 6 or abs(end_y - start_y) < 6:
+            self._draw_chart()
+            return "break"
+
+        x1, y1 = self._chart_canvas_to_data(start_x, start_y)
+        x2, y2 = self._chart_canvas_to_data(end_x, end_y)
+        self.chart_view_range = (
+            min(x1, x2),
+            max(x1, x2),
+            min(y1, y2),
+            max(y1, y2),
+        )
+        self._draw_chart()
+        return "break"
 
     def _update_status(self) -> None:
         if not self.rows:
