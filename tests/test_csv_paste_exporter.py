@@ -3,8 +3,12 @@ from datetime import datetime
 
 from csv_paste_exporter import (
     analyze_table_text,
+    build_chart_data,
     build_default_filename,
+    calculate_axis_range,
     delete_columns,
+    get_chart_column_labels,
+    get_default_chart_column_indices,
     get_preview_headings,
     load_settings,
     move_column,
@@ -12,6 +16,7 @@ from csv_paste_exporter import (
     save_settings,
     write_csv,
     write_table,
+    zoom_axis_range,
 )
 
 
@@ -145,6 +150,78 @@ def test_preview_headings_use_first_row_only_for_display():
     assert get_preview_headings(rows, first_row_is_header=True) == ["应变", "应力"]
     assert get_preview_headings(rows, first_row_is_header=False) == ["列 1", "列 2"]
     assert rows == [["应变", "应力"], ["0.01", "100"]]
+
+
+def test_chart_defaults_to_first_two_columns_and_uses_header_labels():
+    rows = [["Time", "Force", "Note"], ["0", "10", "start"], ["1", "12", "end"]]
+
+    assert get_default_chart_column_indices(rows) == (0, 1)
+    assert get_chart_column_labels(rows, first_row_is_header=True) == [
+        "Time",
+        "Force",
+        "Note",
+    ]
+
+    chart_data = build_chart_data(rows, 0, 1, first_row_is_header=True)
+
+    assert chart_data.points == [(0.0, 10.0), (1.0, 12.0)]
+    assert chart_data.x_range == (0.0, 1.0)
+    assert chart_data.y_range == (10.0, 12.0)
+    assert chart_data.skipped_rows == 0
+
+
+def test_chart_data_skips_non_numeric_rows_and_supports_scientific_notation():
+    rows = [
+        ["X", "Y"],
+        ["0", "1"],
+        ["bad", "2"],
+        ["1.2E-3", "3.4E+2"],
+        ["2", "NaN"],
+    ]
+
+    chart_data = build_chart_data(rows, 0, 1, first_row_is_header=True)
+
+    assert chart_data.points == [(0.0, 1.0), (0.0012, 340.0)]
+    assert chart_data.x_range == (0.0, 0.0012)
+    assert chart_data.y_range == (1.0, 340.0)
+    assert chart_data.skipped_rows == 2
+
+
+def test_chart_axis_range_pads_constant_values():
+    assert calculate_axis_range([10.0, 10.0, 10.0]) == (9.5, 10.5)
+    assert calculate_axis_range([0.0, 0.0]) == (-1.0, 1.0)
+
+    chart_data = build_chart_data(
+        [["X", "Y"], ["5", "0"], ["5", "0"]],
+        0,
+        1,
+        first_row_is_header=True,
+    )
+
+    assert chart_data.x_range == (4.75, 5.25)
+    assert chart_data.y_range == (-1.0, 1.0)
+
+
+def test_chart_helpers_disable_plot_when_table_has_fewer_than_two_columns():
+    rows = [["A"], ["1"], ["2"]]
+
+    assert get_default_chart_column_indices(rows) == (None, None)
+
+    chart_data = build_chart_data(rows, 0, 1, first_row_is_header=False)
+
+    assert chart_data.points == []
+    assert chart_data.x_range is None
+    assert chart_data.y_range is None
+
+
+def test_zoom_axis_range_scales_around_anchor_and_clamps_to_full_range():
+    assert zoom_axis_range((0.0, 10.0), anchor=5.0, scale=0.5) == (2.5, 7.5)
+    assert zoom_axis_range(
+        (2.0, 8.0),
+        anchor=5.0,
+        scale=2.0,
+        full_range=(0.0, 10.0),
+    ) == (0.0, 10.0)
 
 
 def test_settings_round_trip_with_defaults(tmp_path):
