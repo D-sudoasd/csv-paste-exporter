@@ -21,10 +21,10 @@ For most Windows users, download the ready-to-run `.exe` from:
 
 **[Latest Release](https://github.com/D-sudoasd/csv-paste-exporter/releases/latest)**
 
-Run:
+Download and run the Windows asset:
 
 ```text
-CSV列数据整理导出.exe
+CSV-Paste-Exporter-Windows-v0.2.0.exe
 ```
 
 No Python installation is required for the Windows release build.
