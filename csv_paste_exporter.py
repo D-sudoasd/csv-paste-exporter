@@ -44,11 +44,44 @@ ENCODINGS = {
     "UTF-8": "utf-8",
     "GBK": "gbk",
 }
+TARGET_PRESETS = {
+    "excel": {
+        "label": "Excel",
+        "export_format": "csv",
+        "encoding": "UTF-8 BOM",
+    },
+    "origin": {
+        "label": "Origin",
+        "export_format": "txt",
+        "encoding": "UTF-8 BOM",
+    },
+    "pandas": {
+        "label": "Python/pandas",
+        "export_format": "csv",
+        "encoding": "UTF-8",
+    },
+    "matlab": {
+        "label": "MATLAB",
+        "export_format": "csv",
+        "encoding": "UTF-8",
+    },
+    "legacy_gbk": {
+        "label": "旧仪器/GBK",
+        "export_format": "txt",
+        "encoding": "GBK",
+    },
+    "custom": {
+        "label": "自定义",
+        "export_format": "",
+        "encoding": "",
+    },
+}
 DEFAULT_SETTINGS = {
     "export_format": "csv",
     "encoding": "UTF-8 BOM",
     "last_export_dir": "",
     "first_row_is_header": False,
+    "target_preset": "excel",
 }
 
 
@@ -67,6 +100,18 @@ class ChartData:
     x_range: tuple[float, float] | None
     y_range: tuple[float, float] | None
     skipped_rows: int
+
+
+@dataclass(frozen=True)
+class TableDiagnostics:
+    row_count: int
+    column_count: int
+    empty_cell_count: int
+    blank_heading_count: int
+    duplicate_headings: tuple[str, ...]
+    preview_truncated: bool
+    requires_confirmation: bool
+    warnings: tuple[str, ...]
 
 
 def parse_table_text(text: str) -> list[list[str]]:
@@ -176,6 +221,35 @@ def get_chart_column_labels(
     return get_preview_headings(rows, first_row_is_header)
 
 
+def build_column_list_labels(
+    rows: list[list[str]],
+    first_row_is_header: bool,
+    sample_count: int = 3,
+    max_sample_length: int = 18,
+) -> list[str]:
+    if not rows:
+        return []
+
+    column_count = max(len(row) for row in rows)
+    headings = get_preview_headings(rows, first_row_is_header)
+    data_rows = rows[1:] if first_row_is_header else rows
+    labels = []
+    for index in range(column_count):
+        samples = []
+        for row in data_rows:
+            if index >= len(row):
+                continue
+            sample = _shorten_sample_text(row[index], max_sample_length)
+            if sample:
+                samples.append(sample)
+            if len(samples) >= sample_count:
+                break
+
+        sample_suffix = f" | {', '.join(samples)}" if samples else " | 无样例"
+        labels.append(f"{index + 1}. {headings[index]}{sample_suffix}")
+    return labels
+
+
 def calculate_axis_range(values: Iterable[float]) -> tuple[float, float] | None:
     numeric_values = list(values)
     if not numeric_values:
@@ -267,6 +341,61 @@ def build_chart_data(
     )
 
 
+def build_table_diagnostics(
+    rows: list[list[str]],
+    analysis: TableAnalysis,
+    first_row_is_header: bool,
+    preview_row_limit: int = PREVIEW_ROW_LIMIT,
+) -> TableDiagnostics:
+    row_count = len(rows)
+    column_count = max((len(row) for row in rows), default=0)
+    empty_cell_count = sum(cell == "" for row in rows for cell in row)
+    blank_heading_count = 0
+    duplicate_headings: tuple[str, ...] = ()
+    warnings = []
+
+    if empty_cell_count:
+        warnings.append(f"空单元格 {empty_cell_count} 个")
+    if analysis.had_ragged_rows and empty_cell_count:
+        warnings.append("行列不齐已补空")
+
+    if first_row_is_header and rows:
+        first_row = rows[0] + [""] * (column_count - len(rows[0]))
+        headings = [heading.strip() for heading in first_row]
+        blank_heading_count = sum(not heading for heading in headings)
+        duplicate_counts = Counter(heading for heading in headings if heading)
+        duplicate_headings = tuple(
+            heading for heading, count in duplicate_counts.items() if count > 1
+        )
+        if blank_heading_count:
+            warnings.append(f"存在空表头 {blank_heading_count} 个")
+        if duplicate_headings:
+            warnings.append(f"重复表头：{', '.join(duplicate_headings)}")
+
+    return TableDiagnostics(
+        row_count=row_count,
+        column_count=column_count,
+        empty_cell_count=empty_cell_count,
+        blank_heading_count=blank_heading_count,
+        duplicate_headings=duplicate_headings,
+        preview_truncated=row_count > preview_row_limit,
+        requires_confirmation=bool(warnings),
+        warnings=tuple(warnings),
+    )
+
+
+def find_target_preset_key(export_format: str, encoding: str) -> str:
+    for key, preset in TARGET_PRESETS.items():
+        if key == "custom":
+            continue
+        if (
+            preset["export_format"] == export_format
+            and preset["encoding"] == encoding
+        ):
+            return key
+    return "custom"
+
+
 def build_default_filename(format_key: str, now: datetime | None = None) -> str:
     current_time = now or datetime.now()
     extension = EXPORT_FORMATS.get(format_key, EXPORT_FORMATS["csv"])["extension"]
@@ -294,6 +423,14 @@ def load_settings(path: str | Path | None = None) -> dict[str, object]:
             value = loaded.get(key, default_value)
             if isinstance(value, type(default_value)):
                 settings[key] = value
+        if (
+            "target_preset" not in loaded
+            or settings["target_preset"] not in TARGET_PRESETS
+        ):
+            settings["target_preset"] = find_target_preset_key(
+                str(settings["export_format"]),
+                str(settings["encoding"]),
+            )
     return settings
 
 
@@ -307,6 +444,17 @@ def save_settings(path: str | Path | None, settings: dict[str, object]) -> None:
             cleaned[key] = value
     with settings_path.open("w", encoding="utf-8") as handle:
         json.dump(cleaned, handle, ensure_ascii=False, indent=2)
+
+
+def _shorten_sample_text(value: str, max_length: int) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if max_length < 4:
+        max_length = 4
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 3] + "..."
 
 
 def _copy_rows(rows: list[list[str]]) -> list[list[str]]:
@@ -402,7 +550,7 @@ class CsvPasteExporterApp:
         self.root = root
         self.root.title("CSV 列数据整理导出")
         self.root.geometry("1180x720")
-        self.root.minsize(920, 560)
+        self.root.minsize(980, 600)
 
         self.settings_path = get_settings_path()
         self.settings = load_settings(self.settings_path)
@@ -412,12 +560,25 @@ class CsvPasteExporterApp:
         self.preview_after_id: str | None = None
         self.text_dirty = False
         self.status_var = tk.StringVar(value="粘贴数据后会自动预览")
+        target_preset = str(self.settings["target_preset"])
+        if target_preset not in TARGET_PRESETS:
+            target_preset = find_target_preset_key(
+                str(self.settings["export_format"]),
+                str(self.settings["encoding"]),
+            )
         export_format = str(self.settings["export_format"])
+        if target_preset != "custom":
+            export_format = TARGET_PRESETS[target_preset]["export_format"]
         if export_format not in EXPORT_FORMATS:
             export_format = "csv"
         encoding = str(self.settings["encoding"])
+        if target_preset != "custom":
+            encoding = TARGET_PRESETS[target_preset]["encoding"]
         if encoding not in ENCODINGS:
             encoding = "UTF-8 BOM"
+        self.target_preset_var = tk.StringVar(
+            value=TARGET_PRESETS[target_preset]["label"]
+        )
         self.export_format_var = tk.StringVar(value=EXPORT_FORMATS[export_format]["label"])
         self.encoding_var = tk.StringVar(value=encoding)
         self.first_row_is_header_var = tk.BooleanVar(
@@ -444,47 +605,65 @@ class CsvPasteExporterApp:
 
         actions = ttk.Frame(self.root, padding=(10, 10, 10, 4))
         actions.grid(row=0, column=0, sticky="ew")
-        actions.columnconfigure(12, weight=1)
+        actions.columnconfigure(0, weight=1)
 
-        ttk.Button(actions, text="粘贴剪贴板", command=self.paste_clipboard).grid(
+        primary_actions = ttk.Frame(actions)
+        primary_actions.grid(row=0, column=0, sticky="w")
+        ttk.Button(primary_actions, text="粘贴剪贴板", command=self.paste_clipboard).grid(
             row=0, column=0, padx=(0, 8)
         )
-        ttk.Button(actions, text="清空", command=self.clear_all).grid(
+        ttk.Button(primary_actions, text="清空", command=self.clear_all).grid(
             row=0, column=1, padx=(0, 8)
         )
-        ttk.Button(actions, text="整理预览", command=self.refresh_preview).grid(
+        ttk.Button(primary_actions, text="整理预览", command=self.refresh_preview).grid(
             row=0, column=2, padx=(0, 8)
         )
-        ttk.Button(actions, text="导出", command=self.export_table).grid(
-            row=0, column=3, padx=(0, 18)
+        ttk.Button(primary_actions, text="导出", command=self.export_table).grid(
+            row=0, column=3, padx=(0, 12)
         )
-        ttk.Label(actions, text="格式").grid(row=0, column=4, padx=(0, 5))
+        ttk.Checkbutton(
+            primary_actions,
+            text="第一行是表头",
+            variable=self.first_row_is_header_var,
+            command=self._on_header_toggle,
+        ).grid(row=0, column=4, padx=(0, 12))
+
+        export_options = ttk.Frame(actions)
+        export_options.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        export_options.columnconfigure(6, weight=1)
+
+        ttk.Label(export_options, text="目标软件").grid(row=0, column=0, padx=(0, 5))
+        target_box = ttk.Combobox(
+            export_options,
+            textvariable=self.target_preset_var,
+            values=[config["label"] for config in TARGET_PRESETS.values()],
+            state="readonly",
+            width=14,
+        )
+        target_box.grid(row=0, column=1, padx=(0, 12))
+        target_box.bind("<<ComboboxSelected>>", self._on_target_preset_changed)
+
+        ttk.Label(export_options, text="格式").grid(row=0, column=2, padx=(0, 5))
         format_box = ttk.Combobox(
-            actions,
+            export_options,
             textvariable=self.export_format_var,
             values=[config["label"] for config in EXPORT_FORMATS.values()],
             state="readonly",
             width=24,
         )
-        format_box.grid(row=0, column=5, padx=(0, 12))
+        format_box.grid(row=0, column=3, padx=(0, 12))
         format_box.bind("<<ComboboxSelected>>", self._on_export_option_changed)
 
-        ttk.Label(actions, text="编码").grid(row=0, column=6, padx=(0, 5))
+        ttk.Label(export_options, text="编码").grid(row=0, column=4, padx=(0, 5))
         encoding_box = ttk.Combobox(
-            actions,
+            export_options,
             textvariable=self.encoding_var,
             values=list(ENCODINGS),
             state="readonly",
             width=12,
         )
-        encoding_box.grid(row=0, column=7, padx=(0, 12))
+        encoding_box.grid(row=0, column=5, padx=(0, 12))
         encoding_box.bind("<<ComboboxSelected>>", self._on_export_option_changed)
-        ttk.Checkbutton(
-            actions,
-            text="第一行是表头",
-            variable=self.first_row_is_header_var,
-            command=self._on_header_toggle,
-        ).grid(row=0, column=8, padx=(0, 12))
 
         column_actions = ttk.Frame(self.root, padding=(10, 0, 10, 6))
         column_actions.grid(row=1, column=0, sticky="ew")
@@ -531,19 +710,29 @@ class CsvPasteExporterApp:
 
         column_frame = ttk.Frame(preview_frame)
         column_frame.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+        column_frame.columnconfigure(0, weight=1)
         column_frame.rowconfigure(1, weight=1)
         ttk.Label(column_frame, text="列").grid(row=0, column=0, sticky="w")
         self.column_list = tk.Listbox(
             column_frame,
             selectmode=tk.EXTENDED,
             exportselection=False,
-            width=24,
+            width=38,
             height=12,
         )
         column_y = ttk.Scrollbar(column_frame, orient=tk.VERTICAL, command=self.column_list.yview)
-        self.column_list.configure(yscrollcommand=column_y.set)
-        self.column_list.grid(row=1, column=0, sticky="ns")
+        column_x = ttk.Scrollbar(
+            column_frame,
+            orient=tk.HORIZONTAL,
+            command=self.column_list.xview,
+        )
+        self.column_list.configure(
+            yscrollcommand=column_y.set,
+            xscrollcommand=column_x.set,
+        )
+        self.column_list.grid(row=1, column=0, sticky="nsew")
         column_y.grid(row=1, column=1, sticky="ns")
+        column_x.grid(row=2, column=0, sticky="ew")
 
         self.tree = ttk.Treeview(preview_frame, show="headings")
         tree_y = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -607,8 +796,11 @@ class CsvPasteExporterApp:
             textvariable=self.status_var,
             anchor="w",
             padding=(10, 0, 10, 8),
+            justify="left",
+            wraplength=1080,
         )
         status.grid(row=3, column=0, sticky="ew")
+        self.status_label = status
 
     def _bind_events(self) -> None:
         self.text.bind("<KeyRelease>", self._schedule_preview)
@@ -621,6 +813,11 @@ class CsvPasteExporterApp:
         self.chart_canvas.bind("<B1-Motion>", self._on_chart_drag_move)
         self.chart_canvas.bind("<ButtonRelease-1>", self._on_chart_drag_end)
         self.chart_canvas.bind("<Double-Button-1>", self.reset_chart_view)
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        if event.widget is self.root:
+            self.status_label.configure(wraplength=max(420, event.width - 24))
 
     def _schedule_preview(self, _event: tk.Event | None = None) -> None:
         self.text_dirty = True
@@ -628,7 +825,19 @@ class CsvPasteExporterApp:
             self.root.after_cancel(self.preview_after_id)
         self.preview_after_id = self.root.after(180, self.refresh_preview)
 
+    def _on_target_preset_changed(self, _event: tk.Event | None = None) -> None:
+        preset_key = self._current_target_preset_key()
+        if preset_key != "custom":
+            preset = TARGET_PRESETS[preset_key]
+            self.export_format_var.set(
+                EXPORT_FORMATS[preset["export_format"]]["label"]
+            )
+            self.encoding_var.set(preset["encoding"])
+        self._save_current_settings()
+        self._update_status()
+
     def _on_export_option_changed(self, _event: tk.Event | None = None) -> None:
+        self._sync_target_preset_to_current_export_options()
         self._save_current_settings()
         self._update_status()
 
@@ -691,6 +900,12 @@ class CsvPasteExporterApp:
             messagebox.showwarning("没有数据", "请先粘贴需要导出的表格数据。")
             return
 
+        diagnostics = self._current_table_diagnostics()
+        if diagnostics.requires_confirmation and not self._confirm_risky_export(
+            diagnostics
+        ):
+            return
+
         format_key = self._current_export_format_key()
         format_config = EXPORT_FORMATS[format_key]
         encoding_label = self.encoding_var.get()
@@ -725,7 +940,16 @@ class CsvPasteExporterApp:
 
         self._save_current_settings(last_export_dir=str(Path(path).parent))
         self.status_var.set(f"已导出：{path}")
-        self._show_export_success(Path(path))
+        self._show_export_success(Path(path), diagnostics)
+
+    def _confirm_risky_export(self, diagnostics: TableDiagnostics) -> bool:
+        warning_text = "\n".join(f"- {warning}" for warning in diagnostics.warnings)
+        return messagebox.askyesno(
+            "导出前确认",
+            "检测到以下需要确认的表格状态：\n\n"
+            f"{warning_text}\n\n"
+            "这些提示不会自动修改数据。仍然继续导出吗？",
+        )
 
     def delete_selected_columns(self) -> None:
         selected = set(self.column_list.curselection())
@@ -781,12 +1005,16 @@ class CsvPasteExporterApp:
         columns = [f"col_{index + 1}" for index in range(column_count)]
         self.tree["columns"] = columns
         headings = get_preview_headings(rows, self.first_row_is_header_var.get())
+        column_labels = build_column_list_labels(
+            rows,
+            self.first_row_is_header_var.get(),
+        )
 
         for index, column in enumerate(columns):
             heading = headings[index]
             self.tree.heading(column, text=heading)
             self.tree.column(column, width=120, minwidth=70, stretch=False)
-            self.column_list.insert(tk.END, f"{index + 1}. {heading}")
+            self.column_list.insert(tk.END, column_labels[index])
 
         for index in selected_indices or set():
             if 0 <= index < column_count:
@@ -1113,28 +1341,40 @@ class CsvPasteExporterApp:
         self._draw_chart()
         return "break"
 
+    def _current_table_diagnostics(self) -> TableDiagnostics:
+        return build_table_diagnostics(
+            self.rows,
+            self.current_analysis,
+            self.first_row_is_header_var.get(),
+        )
+
     def _update_status(self) -> None:
         if not self.rows:
             self.status_var.set("未检测到有效表格数据")
             return
 
-        row_count = len(self.rows)
-        column_count = max((len(row) for row in self.rows), default=0)
-        empty_cell_count = sum(cell == "" for row in self.rows for cell in row)
+        diagnostics = self._current_table_diagnostics()
         format_key = self._current_export_format_key()
         format_name = EXPORT_FORMATS[format_key]["label"].split(" - ")[0]
+        target_name = TARGET_PRESETS[self._current_target_preset_key()]["label"]
+        health_label = "需确认" if diagnostics.requires_confirmation else "可导出"
         parts = [
-            f"共 {row_count} 行、{column_count} 列",
-            f"空单元格 {empty_cell_count}",
+            health_label,
+            f"共 {diagnostics.row_count} 行、{diagnostics.column_count} 列",
             f"分隔符 {self.current_analysis.delimiter_name}",
-            f"导出 {format_name}",
+            f"空单元格 {diagnostics.empty_cell_count}",
+            f"目标 {target_name}",
+            f"导出 {format_name}/{self.encoding_var.get()}",
         ]
-        if self.current_analysis.had_ragged_rows:
-            parts.append("行列不齐已补空")
-        suffix = ""
-        if row_count > PREVIEW_ROW_LIMIT:
-            suffix = f"；仅预览前 {PREVIEW_ROW_LIMIT} 行，导出包含全部数据"
-        self.status_var.set("；".join(parts) + suffix)
+        status_warnings = [
+            warning
+            for warning in diagnostics.warnings
+            if not warning.startswith("空单元格")
+        ]
+        parts.extend(status_warnings[:3])
+        if diagnostics.preview_truncated:
+            parts.append(f"仅预览前 {PREVIEW_ROW_LIMIT} 行，导出包含全部数据")
+        self.status_var.set("；".join(parts))
 
     def _current_export_format_key(self) -> str:
         label = self.export_format_var.get()
@@ -1142,6 +1382,20 @@ class CsvPasteExporterApp:
             if label == config["label"]:
                 return key
         return "csv"
+
+    def _current_target_preset_key(self) -> str:
+        label = self.target_preset_var.get()
+        for key, config in TARGET_PRESETS.items():
+            if label == config["label"]:
+                return key
+        return "custom"
+
+    def _sync_target_preset_to_current_export_options(self) -> None:
+        preset_key = find_target_preset_key(
+            self._current_export_format_key(),
+            self.encoding_var.get(),
+        )
+        self.target_preset_var.set(TARGET_PRESETS[preset_key]["label"])
 
     def _save_current_settings(self, last_export_dir: str | None = None) -> None:
         settings = {
@@ -1153,6 +1407,7 @@ class CsvPasteExporterApp:
             if last_export_dir is not None
             else str(self.settings.get("last_export_dir", "")),
             "first_row_is_header": self.first_row_is_header_var.get(),
+            "target_preset": self._current_target_preset_key(),
         }
         self.settings = settings
         try:
@@ -1160,7 +1415,7 @@ class CsvPasteExporterApp:
         except OSError as exc:
             self.status_var.set(f"设置保存失败：{exc}")
 
-    def _show_export_success(self, path: Path) -> None:
+    def _show_export_success(self, path: Path, diagnostics: TableDiagnostics) -> None:
         dialog = tk.Toplevel(self.root)
         dialog.title("导出成功")
         dialog.transient(self.root)
@@ -1168,7 +1423,16 @@ class CsvPasteExporterApp:
 
         content = ttk.Frame(dialog, padding=14)
         content.grid(row=0, column=0, sticky="nsew")
-        ttk.Label(content, text=f"已导出：{path}").grid(
+        format_key = self._current_export_format_key()
+        format_name = EXPORT_FORMATS[format_key]["label"].split(" - ")[0]
+        target_name = TARGET_PRESETS[self._current_target_preset_key()]["label"]
+        summary = (
+            f"已导出：{path}\n"
+            f"目标软件：{target_name}\n"
+            f"格式/编码：{format_name} / {self.encoding_var.get()}\n"
+            f"数据规模：{diagnostics.row_count} 行、{diagnostics.column_count} 列"
+        )
+        ttk.Label(content, text=summary, justify="left", wraplength=720).grid(
             row=0,
             column=0,
             columnspan=2,

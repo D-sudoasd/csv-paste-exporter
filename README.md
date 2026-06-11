@@ -56,11 +56,15 @@ Copy columns -> Paste -> Preview -> Export
 - Preview data before export.
 - Treat the first row as a header for easier preview.
 - Quickly preview a point-line chart from selected X/Y columns.
+- Choose target-software presets for Excel, Origin, Python/pandas, MATLAB, or legacy GBK instruments.
+- Show a lightweight export-readiness check with row/column counts, empty cells, and cleanup warnings.
+- Show sample values beside each column name to reduce wrong-column selection.
 - Delete selected columns.
 - Move columns left or right.
 - Restore the original parsed table after column edits.
 - Export as CSV, TXT, or TSV.
 - Choose encoding: UTF-8 BOM, UTF-8, or GBK.
+- Confirm before export only when the cleaned table has warning conditions.
 - Remember the last export directory and export settings.
 - Open the output folder after export.
 - Runs as a single Windows `.exe`.
@@ -128,6 +132,8 @@ The test suite covers:
 - whitespace-delimited fallback parsing
 - CSV/TXT/TSV export
 - UTF-8 BOM, UTF-8, and GBK encoding behavior
+- target-software preset mapping and old settings compatibility
+- export-readiness diagnostics and column sample labels
 - column delete and move operations
 - first-row-as-header preview logic
 - quick chart numeric extraction and axis-range behavior
