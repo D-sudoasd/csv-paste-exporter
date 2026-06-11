@@ -1,12 +1,17 @@
 import csv
+import json
 from datetime import datetime
 
 from csv_paste_exporter import (
+    TARGET_PRESETS,
     analyze_table_text,
     build_chart_data,
+    build_column_list_labels,
     build_default_filename,
+    build_table_diagnostics,
     calculate_axis_range,
     delete_columns,
+    find_target_preset_key,
     get_chart_column_labels,
     get_default_chart_column_indices,
     get_preview_headings,
@@ -224,6 +229,87 @@ def test_zoom_axis_range_scales_around_anchor_and_clamps_to_full_range():
     ) == (0.0, 10.0)
 
 
+def test_target_presets_map_to_existing_formats_and_encodings():
+    assert TARGET_PRESETS["excel"]["export_format"] == "csv"
+    assert TARGET_PRESETS["excel"]["encoding"] == "UTF-8 BOM"
+    assert TARGET_PRESETS["origin"]["export_format"] == "txt"
+    assert TARGET_PRESETS["legacy_gbk"]["encoding"] == "GBK"
+
+    assert find_target_preset_key("csv", "UTF-8 BOM") == "excel"
+    assert find_target_preset_key("txt", "GBK") == "legacy_gbk"
+    assert find_target_preset_key("tsv", "GBK") == "custom"
+
+
+def test_table_diagnostics_identifies_confirmation_risks():
+    analysis = analyze_table_text("A\tA\t\n1\t2\t\n3\t\t5\n")
+
+    diagnostics = build_table_diagnostics(
+        analysis.rows,
+        analysis,
+        first_row_is_header=True,
+    )
+
+    assert diagnostics.requires_confirmation is True
+    assert diagnostics.row_count == 3
+    assert diagnostics.column_count == 3
+    assert diagnostics.empty_cell_count == 3
+    assert diagnostics.blank_heading_count == 1
+    assert diagnostics.duplicate_headings == ("A",)
+    assert "空单元格 3 个" in diagnostics.warnings
+    assert "存在空表头 1 个" in diagnostics.warnings
+    assert "重复表头：A" in diagnostics.warnings
+
+
+def test_table_diagnostics_marks_clean_tables_as_ready():
+    analysis = analyze_table_text("Strain\tStress\n0\t0\n0.1\t100\n")
+
+    diagnostics = build_table_diagnostics(
+        analysis.rows,
+        analysis,
+        first_row_is_header=True,
+    )
+
+    assert diagnostics.requires_confirmation is False
+    assert diagnostics.warnings == ()
+
+
+def test_table_diagnostics_does_not_keep_stale_ragged_warning_after_column_delete():
+    analysis = analyze_table_text("A\tB\tC\n1\t2\n3\t4\t5\n")
+    rows_without_padding = delete_columns(analysis.rows, {2})
+
+    diagnostics = build_table_diagnostics(
+        rows_without_padding,
+        analysis,
+        first_row_is_header=True,
+    )
+
+    assert diagnostics.empty_cell_count == 0
+    assert "行列不齐已补空" not in diagnostics.warnings
+    assert diagnostics.requires_confirmation is False
+
+
+def test_column_list_labels_include_sample_values_and_truncate_long_text():
+    rows = [
+        ["Strain", "Stress MPa", "Comment"],
+        ["0", "100", "short"],
+        ["0.01", "200", "this-is-a-very-long-value"],
+        ["0.02", "250", "ignored"],
+    ]
+
+    labels = build_column_list_labels(
+        rows,
+        first_row_is_header=True,
+        sample_count=2,
+        max_sample_length=10,
+    )
+
+    assert labels == [
+        "1. Strain | 0, 0.01",
+        "2. Stress MPa | 100, 200",
+        "3. Comment | short, this-is...",
+    ]
+
+
 def test_settings_round_trip_with_defaults(tmp_path):
     settings_path = tmp_path / "settings.json"
 
@@ -232,6 +318,7 @@ def test_settings_round_trip_with_defaults(tmp_path):
         "encoding": "UTF-8 BOM",
         "last_export_dir": "",
         "first_row_is_header": False,
+        "target_preset": "excel",
     }
 
     save_settings(
@@ -241,6 +328,7 @@ def test_settings_round_trip_with_defaults(tmp_path):
             "encoding": "GBK",
             "last_export_dir": "D:/data",
             "first_row_is_header": True,
+            "target_preset": "legacy_gbk",
         },
     )
 
@@ -249,7 +337,29 @@ def test_settings_round_trip_with_defaults(tmp_path):
         "encoding": "GBK",
         "last_export_dir": "D:/data",
         "first_row_is_header": True,
+        "target_preset": "legacy_gbk",
     }
+
+
+def test_load_settings_infers_target_preset_for_old_settings_file(tmp_path):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "export_format": "txt",
+                "encoding": "GBK",
+                "last_export_dir": "D:/data",
+                "first_row_is_header": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(settings_path)
+
+    assert settings["target_preset"] == "legacy_gbk"
+    assert settings["export_format"] == "txt"
+    assert settings["encoding"] == "GBK"
 
 
 def test_build_default_filename_uses_format_extension():
