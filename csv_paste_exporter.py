@@ -245,6 +245,26 @@ def get_default_chart_column_indices(
     return 0, 1
 
 
+def resolve_chart_column_indices(
+    x_column: int | None,
+    y_column: int | None,
+    column_count: int,
+) -> tuple[int | None, int | None]:
+    if column_count < 2:
+        return None, None
+
+    x_index = x_column if x_column is not None and 0 <= x_column < column_count else None
+    y_index = y_column if y_column is not None and 0 <= y_column < column_count else None
+    if x_index is None:
+        x_index = 0
+    if y_index is None or y_index == x_index:
+        y_index = next(
+            (index for index in range(column_count) if index != x_index),
+            1,
+        )
+    return x_index, y_index
+
+
 def get_chart_column_labels(
     rows: list[list[str]],
     first_row_is_header: bool,
@@ -1151,10 +1171,11 @@ class CsvPasteExporterApp:
                 self.rows
             )
         else:
-            if self.chart_x_index is None or self.chart_x_index >= column_count:
-                self.chart_x_index = 0
-            if self.chart_y_index is None or self.chart_y_index >= column_count:
-                self.chart_y_index = 1
+            self.chart_x_index, self.chart_y_index = resolve_chart_column_indices(
+                self.chart_x_index,
+                self.chart_y_index,
+                column_count,
+            )
 
         if self.chart_x_index is None or self.chart_y_index is None:
             self._set_chart_empty("至少需要两列数据才能画图")

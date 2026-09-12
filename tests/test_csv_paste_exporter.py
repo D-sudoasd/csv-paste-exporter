@@ -22,6 +22,7 @@ from csv_paste_exporter import (
     get_chart_column_labels,
     get_default_chart_column_indices,
     get_preview_headings,
+    resolve_chart_column_indices,
     load_settings,
     move_column,
     parse_table_text,
@@ -238,6 +239,14 @@ def test_chart_column_indices_remap_after_delete_and_move():
     assert remap_column_index_after_move(2, 0, 1) == 2
     assert remap_column_index_after_move(1, 0, 1) == 0
     assert remap_column_index_after_move(0, 0, 1) == 1
+
+
+def test_resolve_chart_column_indices_avoids_plotting_a_column_against_itself():
+    assert resolve_chart_column_indices(None, 0, 2) == (0, 1)
+    assert resolve_chart_column_indices(0, None, 3) == (0, 1)
+    assert resolve_chart_column_indices(0, 0, 2) == (0, 1)
+    assert resolve_chart_column_indices(1, 1, 3) == (1, 0)
+    assert resolve_chart_column_indices(None, None, 1) == (None, None)
 
 
 def test_preview_headings_use_first_row_only_for_display():
@@ -641,6 +650,24 @@ def test_app_chart_axes_follow_deleted_leading_column(exporter_app):
     app.column_list.selection_set(0)
     app.delete_selected_columns()
     assert app.rows[0] == ["B", "C"]
+    assert app.chart_x_index == 0
+    assert app.chart_y_index == 1
+    assert app.chart_points == [(1.0, 2.0), (4.0, 5.0)]
+
+
+def test_app_default_chart_axes_stay_distinct_after_deleting_column_zero(
+    exporter_app,
+):
+    app = exporter_app
+    _load_preview_text(app, "A\tB\tC\n0\t1\t2\n3\t4\t5\n")
+    app.first_row_is_header_var.set(True)
+    app._on_header_toggle()
+    assert app.chart_x_index == 0
+    assert app.chart_y_index == 1
+    app.column_list.selection_set(0)
+    app.delete_selected_columns()
+    assert app.rows[0] == ["B", "C"]
+    assert app.chart_x_index != app.chart_y_index
     assert app.chart_x_index == 0
     assert app.chart_y_index == 1
     assert app.chart_points == [(1.0, 2.0), (4.0, 5.0)]
