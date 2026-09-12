@@ -32,12 +32,15 @@ Typical uses: tensile stress–strain columns, XRD `2theta`/intensity pairs, spe
 
 ### Format guide
 
+Matches the **目标软件** presets in the app. TSV is available from **格式** (or **自定义**).
+
 | Target | Format | Encoding |
 | --- | --- | --- |
-| Excel (Windows) | CSV | UTF-8 BOM |
-| Python / pandas | CSV or TSV | UTF-8 |
-| Origin | TXT (tab) | UTF-8 BOM or GBK |
-| MATLAB / R | CSV or TSV | UTF-8 |
+| Excel | CSV | UTF-8 BOM |
+| Origin | TXT (tab) | UTF-8 BOM |
+| Python / pandas | CSV | UTF-8 |
+| MATLAB | CSV | UTF-8 |
+| 旧仪器/GBK | TXT (tab) | GBK |
 
 <p align="center">
   <img src="assets/readme/section-02-use.svg" width="100%" alt="02 Use: download the EXE and export in minutes.">
@@ -45,22 +48,34 @@ Typical uses: tensile stress–strain columns, XRD `2theta`/intensity pairs, spe
 
 ## Download
 
-**[Latest Release](https://github.com/D-sudoasd/csv-paste-exporter/releases/latest)** — e.g. `CSV-Paste-Exporter-Windows-v0.2.0.exe`. No Python required for the release build.
+**[Latest Release](https://github.com/D-sudoasd/csv-paste-exporter/releases/latest)** — Windows EXE, no Python required. The tagged installer may lag `main`; run from source (below) for the current GUI, presets, and chart.
 
-1. Double-click the EXE  
-2. Copy columns from Origin / Excel / instrument software  
-3. **粘贴剪贴板** → check preview → choose format → **导出**
+## Use the GUI
+
+1. Copy columns from Origin / Excel / instrument software  
+2. **粘贴剪贴板** (or paste into **粘贴区**)  
+3. Optional: **第一行是表头**, **目标软件** (Excel / Origin / Python/pandas / MATLAB / 旧仪器/GBK)  
+4. Check **预览**; use **整理预览** after editing the paste box  
+5. Optional: **删除选中列** / **上移列** / **下移列** / **恢复原始数据**  
+6. **导出** → CSV / TXT / TSV with UTF-8 BOM, UTF-8, or GBK  
+
+**清空** clears the paste box and preview. Settings are stored at `%APPDATA%\CsvPasteExporter\settings.json`. Default: first row is data until **第一行是表头** is checked.
 
 ## Develop from source
 
-Runtime is stdlib-only:
+Runtime is Python stdlib + Tkinter. Dev extras (pytest, PyInstaller) are in `requirements-dev.txt`:
 
 ```powershell
+py -m pip install -r requirements-dev.txt
 py csv_paste_exporter.py
 py -m pytest -q
 ```
 
-Build EXE: see `requirements-dev.txt` + PyInstaller one-file windowed build in project docs/history.
+Build a windowed EXE:
+
+```powershell
+py -m PyInstaller --noconfirm --clean --onefile --windowed --name "CSV列数据整理导出" --distpath "dist" --workpath "build" --specpath "build" "csv_paste_exporter.py"
+```
 
 ## License
 
