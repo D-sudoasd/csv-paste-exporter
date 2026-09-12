@@ -17,6 +17,9 @@ from tkinter import filedialog, messagebox, ttk
 
 
 EXPLICIT_DELIMITERS = ("\t", ",", ";")
+# When two delimiters split every row equally well, prefer tab (Excel/Origin
+# clipboard) then semicolon (EU CSV) over comma (also a thousands/decimal mark).
+_DELIMITER_PRIORITY = {"\t": 2, ";": 1, ",": 0}
 PREVIEW_ROW_LIMIT = 500
 APP_DIR_NAME = "CsvPasteExporter"
 EXPORT_FORMATS = {
@@ -120,6 +123,8 @@ def parse_table_text(text: str) -> list[list[str]]:
 
 
 def analyze_table_text(text: str) -> TableAnalysis:
+    if text:
+        text = text.replace("\ufeff", "").replace("\x00", "")
     if not text or not text.strip():
         return TableAnalysis([], None, "无", False, 0)
 
@@ -164,10 +169,36 @@ def delete_columns(rows: list[list[str]], column_indices: set[int]) -> list[list
     if not column_indices:
         return [row[:] for row in rows]
 
-    return [
+    trimmed = [
         [cell for index, cell in enumerate(row) if index not in column_indices]
         for row in rows
     ]
+    cleaned, _had_ragged, _empty = _clean_table_with_metadata(trimmed)
+    return cleaned
+
+
+def remap_column_index_after_delete(
+    index: int | None, removed: set[int]
+) -> int | None:
+    if index is None:
+        return None
+    if index in removed:
+        return None
+    return index - sum(1 for item in removed if item < index)
+
+
+def remap_column_index_after_move(
+    index: int | None, source: int, target: int
+) -> int | None:
+    if index is None:
+        return None
+    if index == source:
+        return target
+    if source < index <= target:
+        return index - 1
+    if target <= index < source:
+        return index + 1
+    return index
 
 
 def move_column(rows: list[list[str]], column_index: int, direction: int) -> list[list[str]]:
@@ -384,15 +415,22 @@ def build_table_diagnostics(
     )
 
 
-def find_target_preset_key(export_format: str, encoding: str) -> str:
-    for key, preset in TARGET_PRESETS.items():
-        if key == "custom":
-            continue
-        if (
-            preset["export_format"] == export_format
-            and preset["encoding"] == encoding
-        ):
-            return key
+def find_target_preset_key(
+    export_format: str,
+    encoding: str,
+    current_key: str | None = None,
+) -> str:
+    matches = [
+        key
+        for key, preset in TARGET_PRESETS.items()
+        if key != "custom"
+        and preset["export_format"] == export_format
+        and preset["encoding"] == encoding
+    ]
+    if current_key in matches:
+        return current_key
+    if matches:
+        return matches[0]
     return "custom"
 
 
@@ -423,6 +461,10 @@ def load_settings(path: str | Path | None = None) -> dict[str, object]:
             value = loaded.get(key, default_value)
             if isinstance(value, type(default_value)):
                 settings[key] = value
+        if settings["export_format"] not in EXPORT_FORMATS:
+            settings["export_format"] = DEFAULT_SETTINGS["export_format"]
+        if settings["encoding"] not in ENCODINGS:
+            settings["encoding"] = DEFAULT_SETTINGS["encoding"]
         if (
             "target_preset" not in loaded
             or settings["target_preset"] not in TARGET_PRESETS
@@ -464,14 +506,21 @@ def _copy_rows(rows: list[list[str]]) -> list[list[str]]:
 def _choose_delimiter(text: str) -> str | None:
     scores = []
     for delimiter in EXPLICIT_DELIMITERS:
-        score = _score_delimiter(text, delimiter)
-        if score[0] > 0:
-            scores.append((score, delimiter))
+        multi_column_rows, consistency, _widest_row = _score_delimiter(text, delimiter)
+        if multi_column_rows > 0:
+            scores.append(
+                (
+                    multi_column_rows,
+                    consistency,
+                    _DELIMITER_PRIORITY.get(delimiter, 0),
+                    delimiter,
+                )
+            )
 
     if not scores:
         return None
 
-    return max(scores, key=lambda item: item[0])[1]
+    return max(scores)[3]
 
 
 def _delimiter_name(delimiter: str) -> str:
@@ -515,10 +564,6 @@ def _parse_whitespace_table(text: str) -> list[list[str]]:
     return rows
 
 
-def _clean_table(rows: Iterable[list[str]]) -> list[list[str]]:
-    return _clean_table_with_metadata(rows)[0]
-
-
 def _clean_table_with_metadata(
     rows: Iterable[list[str]],
 ) -> tuple[list[list[str]], bool, int]:
@@ -559,6 +604,7 @@ class CsvPasteExporterApp:
         self.current_analysis = TableAnalysis([], None, "无", False, 0)
         self.preview_after_id: str | None = None
         self.text_dirty = False
+        self._last_preview_text = "\n"
         self.status_var = tk.StringVar(value="粘贴数据后会自动预览")
         target_preset = str(self.settings["target_preset"])
         if target_preset not in TARGET_PRESETS:
@@ -819,10 +865,20 @@ class CsvPasteExporterApp:
         if event.widget is self.root:
             self.status_label.configure(wraplength=max(420, event.width - 24))
 
-    def _schedule_preview(self, _event: tk.Event | None = None) -> None:
-        self.text_dirty = True
+    def _cancel_scheduled_preview(self) -> None:
         if self.preview_after_id is not None:
-            self.root.after_cancel(self.preview_after_id)
+            try:
+                self.root.after_cancel(self.preview_after_id)
+            except tk.TclError:
+                pass
+            self.preview_after_id = None
+
+    def _schedule_preview(self, _event: tk.Event | None = None) -> None:
+        text = self.text.get("1.0", tk.END)
+        if text == self._last_preview_text:
+            return
+        self.text_dirty = True
+        self._cancel_scheduled_preview()
         self.preview_after_id = self.root.after(180, self.refresh_preview)
 
     def _on_target_preset_changed(self, _event: tk.Event | None = None) -> None:
@@ -852,34 +908,43 @@ class CsvPasteExporterApp:
         except tk.TclError:
             self.status_var.set("剪贴板里没有可读取的文本")
             return
+        if not clipboard_text or not clipboard_text.strip():
+            self.status_var.set("剪贴板里没有可读取的文本")
+            return
 
+        self._cancel_scheduled_preview()
         self.text.delete("1.0", tk.END)
         self.text.insert("1.0", clipboard_text)
+        self.text_dirty = True
         self.refresh_preview()
 
     def clear_all(self) -> None:
+        self._cancel_scheduled_preview()
         self.text.delete("1.0", tk.END)
         self.rows = []
         self.original_rows = []
         self.current_analysis = TableAnalysis([], None, "无", False, 0)
         self.text_dirty = False
+        self._last_preview_text = self.text.get("1.0", tk.END)
         self._render_table([], reset_chart_selection=True)
         self.status_var.set("已清空")
 
     def refresh_preview(self) -> None:
-        if self.preview_after_id is not None:
-            try:
-                self.root.after_cancel(self.preview_after_id)
-            except tk.TclError:
-                pass
-        self.preview_after_id = None
+        self._cancel_scheduled_preview()
         text = self.text.get("1.0", tk.END)
+        if not self.text_dirty and text == self._last_preview_text:
+            selected = set(self.column_list.curselection())
+            self._render_table(self.rows, selected_indices=selected)
+            self._update_status()
+            return
         try:
             self.current_analysis = analyze_table_text(text)
         except csv.Error as exc:
             self.rows = []
             self.original_rows = []
             self.current_analysis = TableAnalysis([], None, "无", False, 0)
+            self.text_dirty = False
+            self._last_preview_text = text
             self._render_table([], reset_chart_selection=True)
             self.status_var.set(f"解析失败：{exc}")
             return
@@ -887,6 +952,7 @@ class CsvPasteExporterApp:
         self.original_rows = _copy_rows(self.current_analysis.rows)
         self.rows = _copy_rows(self.current_analysis.rows)
         self.text_dirty = False
+        self._last_preview_text = text
         self._render_table(self.rows, reset_chart_selection=True)
         self._update_status()
 
@@ -933,7 +999,7 @@ class CsvPasteExporterApp:
                 delimiter=str(format_config["delimiter"]),
                 encoding=encoding,
             )
-        except (OSError, UnicodeError) as exc:
+        except (OSError, UnicodeError, csv.Error) as exc:
             messagebox.showerror("导出失败", str(exc))
             self.status_var.set(f"导出失败：{exc}")
             return
@@ -951,7 +1017,14 @@ class CsvPasteExporterApp:
             "这些提示不会自动修改数据。仍然继续导出吗？",
         )
 
+    def _prepare_column_edit(self) -> None:
+        if self.text_dirty:
+            self.refresh_preview()
+        else:
+            self._cancel_scheduled_preview()
+
     def delete_selected_columns(self) -> None:
+        self._prepare_column_edit()
         selected = set(self.column_list.curselection())
         if not selected:
             messagebox.showinfo("未选择列", "请先在左侧列列表中选择需要删除的列。")
@@ -962,11 +1035,19 @@ class CsvPasteExporterApp:
             messagebox.showwarning("无法删除", "至少需要保留一列。")
             return
 
+        self.chart_x_index = remap_column_index_after_delete(
+            self.chart_x_index, selected
+        )
+        self.chart_y_index = remap_column_index_after_delete(
+            self.chart_y_index, selected
+        )
         self.rows = delete_columns(self.rows, selected)
+        self.text_dirty = False
         self._render_table(self.rows)
         self._update_status()
 
     def move_selected_column(self, direction: int) -> None:
+        self._prepare_column_edit()
         selected = list(self.column_list.curselection())
         if len(selected) != 1:
             messagebox.showinfo("选择一列", "请只选择一列进行移动。")
@@ -978,12 +1059,21 @@ class CsvPasteExporterApp:
         if target_index < 0 or target_index >= column_count:
             return
 
+        self.chart_x_index = remap_column_index_after_move(
+            self.chart_x_index, column_index, target_index
+        )
+        self.chart_y_index = remap_column_index_after_move(
+            self.chart_y_index, column_index, target_index
+        )
         self.rows = move_column(self.rows, column_index, direction)
+        self.text_dirty = False
         self._render_table(self.rows, selected_indices={target_index})
         self._update_status()
 
     def restore_original_data(self) -> None:
+        self._prepare_column_edit()
         self.rows = _copy_rows(self.original_rows)
+        self.text_dirty = False
         self._render_table(self.rows)
         self._update_status()
 
@@ -998,6 +1088,14 @@ class CsvPasteExporterApp:
         self.column_list.delete(0, tk.END)
 
         if not rows:
+            self.tree["columns"] = ("empty",)
+            self.tree.heading("empty", text="预览")
+            self.tree.column("empty", width=420, minwidth=160, stretch=True)
+            self.tree.insert(
+                "",
+                tk.END,
+                values=("尚未检测到表格。请粘贴数据，或点击「整理预览」。",),
+            )
             self._update_chart_controls(reset_selection=True)
             return
 
@@ -1042,7 +1140,10 @@ class CsvPasteExporterApp:
             self.chart_x_box.configure(state="disabled")
             self.chart_y_box.configure(state="disabled")
             self.chart_info_var.set("")
-            self._set_chart_empty("至少需要两列数据才能画图")
+            if not self.rows:
+                self._set_chart_empty("粘贴至少两列数值数据后显示图表")
+            else:
+                self._set_chart_empty("至少需要两列数据才能画图")
             return
 
         if reset_selection:
@@ -1350,7 +1451,11 @@ class CsvPasteExporterApp:
 
     def _update_status(self) -> None:
         if not self.rows:
-            self.status_var.set("未检测到有效表格数据")
+            paste_text = self.text.get("1.0", tk.END)
+            if not paste_text.strip():
+                self.status_var.set("粘贴数据后会自动预览")
+            else:
+                self.status_var.set("未检测到有效表格数据")
             return
 
         diagnostics = self._current_table_diagnostics()
@@ -1358,14 +1463,20 @@ class CsvPasteExporterApp:
         format_name = EXPORT_FORMATS[format_key]["label"].split(" - ")[0]
         target_name = TARGET_PRESETS[self._current_target_preset_key()]["label"]
         health_label = "需确认" if diagnostics.requires_confirmation else "可导出"
+        header_label = (
+            "含表头" if self.first_row_is_header_var.get() else "首行作数据"
+        )
         parts = [
             health_label,
             f"共 {diagnostics.row_count} 行、{diagnostics.column_count} 列",
+            header_label,
             f"分隔符 {self.current_analysis.delimiter_name}",
             f"空单元格 {diagnostics.empty_cell_count}",
             f"目标 {target_name}",
             f"导出 {format_name}/{self.encoding_var.get()}",
         ]
+        if self.rows != self.original_rows:
+            parts.append("已调整列")
         status_warnings = [
             warning
             for warning in diagnostics.warnings
@@ -1394,6 +1505,7 @@ class CsvPasteExporterApp:
         preset_key = find_target_preset_key(
             self._current_export_format_key(),
             self.encoding_var.get(),
+            self._current_target_preset_key(),
         )
         self.target_preset_var.set(TARGET_PRESETS[preset_key]["label"])
 
@@ -1420,6 +1532,8 @@ class CsvPasteExporterApp:
         dialog.title("导出成功")
         dialog.transient(self.root)
         dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
 
         content = ttk.Frame(dialog, padding=14)
         content.grid(row=0, column=0, sticky="nsew")
@@ -1444,11 +1558,19 @@ class CsvPasteExporterApp:
             text="打开文件夹",
             command=lambda: self._open_export_folder(path),
         ).grid(row=1, column=0, padx=(0, 8), sticky="e")
-        ttk.Button(content, text="关闭", command=dialog.destroy).grid(
-            row=1,
-            column=1,
-            sticky="w",
-        )
+        close_button = ttk.Button(content, text="关闭", command=dialog.destroy)
+        close_button.grid(row=1, column=1, sticky="w")
+
+        dialog.update_idletasks()
+        width = dialog.winfo_reqwidth()
+        height = dialog.winfo_reqheight()
+        root_width = max(self.root.winfo_width(), 1)
+        root_height = max(self.root.winfo_height(), 1)
+        x = self.root.winfo_rootx() + max(0, (root_width - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (root_height - height) // 2)
+        dialog.geometry(f"+{x}+{y}")
+        dialog.grab_set()
+        close_button.focus_set()
 
     def _open_export_folder(self, path: Path) -> None:
         try:
